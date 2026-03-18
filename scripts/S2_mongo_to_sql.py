@@ -34,7 +34,7 @@ col_temperature = db["temperature"]
 # =========================================================
 mqtt_client = mqtt.Client(
     mqtt.CallbackAPIVersion.VERSION2,
-    client_id="S2_Grupo6"
+    client_id="S2_Grupo34"
 )
 
 
@@ -81,13 +81,13 @@ def filtro_documento_igual(tipo, documento):
 
     if tipo == "sound":
         return {
-            "Room": documento.get("Room"),
+            "Player": documento.get("Player"),
             "Sound": documento.get("Sound"),
         }
 
     if tipo == "temperature":
         return {
-            "Room": documento.get("Room"),
+            "Player": documento.get("Player"),
             "Temperature": documento.get("Temperature"),
         }
 
