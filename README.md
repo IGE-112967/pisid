@@ -1,6 +1,6 @@
 # PISID – Integração de Dados com MQTT, MongoDB e MySQL
 
-## Descrição do projeto
+## Descrição do projeto Grupo - 34
 
 Este projeto foi desenvolvido no âmbito da unidade curricular de PISID e tem como objetivo recolher, armazenar e encaminhar dados gerados durante a execução do jogo MazeRun.
 
