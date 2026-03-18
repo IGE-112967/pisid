@@ -11,19 +11,14 @@ from pymongo import MongoClient
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
 
-# O jogo publica movimento com sufixo do jogador, por exemplo:
-# pisid_mazemov_34
-MQTT_TOPIC_MOV = "pisid_mazemov/+"
-
-# Para som e temperatura, ajusta estes nomes se for necessário.
-# Se estiverem trocados no jogo, o script trata pelo conteúdo.
-MQTT_TOPIC_SOUND = "pisid_mazesound"
-MQTT_TOPIC_TEMP = "pisid_mazetemp"
+GRUPO = 34
+MQTT_TOPIC_MOV = f"pisid_mazemov_34"
+MQTT_TOPIC_SOUND = f"pisid_mazesound_34"
+MQTT_TOPIC_TEMP = f"pisid_mazetemp_34"
 
 MONGO_URI = "mongodb://localhost:27017/?directConnection=true"
 MONGO_DB = "pisid"
 
-# Janelas simples para spam imediato
 JANELA_SPAM_MOV = 3
 JANELA_SPAM_SOUND = 2
 JANELA_SPAM_TEMP = 2
@@ -113,20 +108,20 @@ def validar_movimento(data):
 
 
 def validar_som(data):
-    campos = ["Room", "Sound", "Hour"]
+    campos = ["Player", "Hour", "Sound"]
     for campo in campos:
         if campo not in data:
             return False, f"Campo em falta: {campo}"
 
     try:
-        room = int(data["Room"])
+        player = int(data["Player"])
         sound = float(data["Sound"])
         parse_datetime(data["Hour"])
     except (ValueError, TypeError) as e:
         return False, str(e)
 
-    if room < 0:
-        return False, "Room negativo"
+    if player < 0:
+        return False, "Player negativo"
 
     if sound < 0 or sound > 140:
         return False, f"Som fora do intervalo: {sound}"
@@ -135,20 +130,20 @@ def validar_som(data):
 
 
 def validar_temperatura(data):
-    campos = ["Room", "Temperature", "Hour"]
+    campos = ["Player", "Hour", "Temperature"]
     for campo in campos:
         if campo not in data:
             return False, f"Campo em falta: {campo}"
 
     try:
-        room = int(data["Room"])
+        player = int(data["Player"])
         temperatura = float(data["Temperature"])
         parse_datetime(data["Hour"])
     except (ValueError, TypeError) as e:
         return False, str(e)
 
-    if room < 0:
-        return False, "Room negativo"
+    if player < 0:
+        return False, "Player negativo"
 
     if temperatura < -50 or temperatura > 100:
         return False, f"Temperatura fora do intervalo plausível: {temperatura}"
@@ -176,7 +171,7 @@ def e_spam_som(data):
     limite = datetime.now() - timedelta(seconds=JANELA_SPAM_SOUND)
 
     return col_sound.find_one({
-        "Room": int(data["Room"]),
+        "Player": int(data["Player"]),
         "Sound": float(data["Sound"]),
         "ReceivedAt": {"$gte": limite}
     }) is not None
@@ -186,7 +181,7 @@ def e_spam_temperatura(data):
     limite = datetime.now() - timedelta(seconds=JANELA_SPAM_TEMP)
 
     return col_temperature.find_one({
-        "Room": int(data["Room"]),
+        "Player": int(data["Player"]),
         "Temperature": float(data["Temperature"]),
         "ReceivedAt": {"$gte": limite}
     }) is not None
@@ -196,18 +191,19 @@ def e_spam_temperatura(data):
 # CLASSIFICAÇÃO DA MENSAGEM
 # =========================================================
 def tipo_da_mensagem(topico, data):
-    # Movimento pelo tópico ou pelos campos
-    if topico.startswith("pisid_mazemov/") or all(
+    if topico == MQTT_TOPIC_MOV or all(
         campo in data for campo in ["Player", "Marsami", "RoomOrigin", "RoomDestiny", "Status"]
     ):
         return "movement"
 
-    # Som pelo conteúdo
-    if all(campo in data for campo in ["Room", "Sound", "Hour"]):
+    if topico == MQTT_TOPIC_SOUND or all(
+        campo in data for campo in ["Player", "Hour", "Sound"]
+    ):
         return "sound"
 
-    # Temperatura pelo conteúdo
-    if all(campo in data for campo in ["Room", "Temperature", "Hour"]):
+    if topico == MQTT_TOPIC_TEMP or all(
+        campo in data for campo in ["Player", "Hour", "Temperature"]
+    ):
         return "temperature"
 
     return None
@@ -284,7 +280,7 @@ def on_message(client, userdata, msg):
                 return
 
             col_sound.insert_one(data)
-            print(f"[S1] Som inserido: Room={data['Room']} Sound={data['Sound']}")
+            print(f"[S1] Som inserido: Player={data['Player']} Sound={data['Sound']}")
             return
 
         if tipo == "temperature":
@@ -300,7 +296,7 @@ def on_message(client, userdata, msg):
                 return
 
             col_temperature.insert_one(data)
-            print(f"[S1] Temperatura inserida: Room={data['Room']} Temp={data['Temperature']}")
+            print(f"[S1] Temperatura inserida: Player={data['Player']} Temp={data['Temperature']}")
             return
 
         registar_flagged(data, "Tópico ou estrutura desconhecida", topico=topico, payload=payload)
@@ -321,7 +317,7 @@ if __name__ == "__main__":
 
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
-        client_id="S1_Grupo6"
+        client_id="S1_Grupo34"
     )
 
     client.on_connect = on_connect
