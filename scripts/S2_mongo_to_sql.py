@@ -11,13 +11,19 @@ from pymongo import MongoClient
 # =========================================================
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
+
+# tópico intermédio para seguir para SQL / próximo passo
 MQTT_TOPIC_TO_SQL = "pisid_to_sql_34"
+
+# tópico dos atuadores / score
+MQTT_TOPIC_ACT = "pisid_mazeact"
 
 MONGO_URI = "mongodb://localhost:27017/?directConnection=true"
 MONGO_DB = "pisid"
 
 INTERVALO_SEGUNDOS = 5
 JANELA_DUPLICADOS_SEGUNDOS = 10
+MAX_SCORE_POR_SALA = 3
 
 # =========================================================
 # LIGAÇÃO AO MONGO
@@ -25,10 +31,16 @@ JANELA_DUPLICADOS_SEGUNDOS = 10
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[MONGO_DB]
 
+# coleções já existentes
 col_movement = db["movement"]
 col_sound = db["sound"]
 col_temperature = db["temperature"]
 col_flagged = db["flagged"]
+
+# coleções novas para o tratamento da pontuação
+col_marsami_state = db["marsami_state"]
+col_room_occupation = db["room_occupation"]
+col_score_events = db["score_events"]
 
 # =========================================================
 # MQTT
@@ -103,8 +115,25 @@ def enviar_para_mqtt(tipo, documento):
     print(f"[S2] Documento enviado ({tipo}) -> {documento['_id']}")
 
 
+def enviar_score(player, room):
+    payload = {
+        "Type": "Score",
+        "Player": int(player),
+        "Room": int(room)
+    }
+
+    info = mqtt_client.publish(
+        MQTT_TOPIC_ACT,
+        json.dumps(payload, ensure_ascii=False),
+        qos=1
+    )
+    info.wait_for_publish()
+
+    print(f"[S2] Score enviado -> Player={player}, Room={room}")
+
+
 # =========================================================
-# VALIDAÇÃO SIMPLES
+# VALIDAÇÃO
 # =========================================================
 def validar_movimento(documento):
     campos = ["Player", "Marsami", "RoomOrigin", "RoomDestiny", "Status"]
@@ -224,6 +253,209 @@ def existe_igual_tratado_recentemente(colecao, tipo, documento):
 
 
 # =========================================================
+# TRATAMENTO DE MARSAMIS / OCUPAÇÃO / SCORE
+# =========================================================
+def obter_paridade(marsami):
+    return "even" if int(marsami) % 2 == 0 else "odd"
+
+
+def obter_estado_marsami(player, marsami):
+    return col_marsami_state.find_one({
+        "Player": int(player),
+        "Marsami": int(marsami)
+    })
+
+
+def guardar_estado_marsami(player, marsami, room, parity, active=True):
+    col_marsami_state.update_one(
+        {
+            "Player": int(player),
+            "Marsami": int(marsami)
+        },
+        {
+            "$set": {
+                "CurrentRoom": int(room),
+                "Parity": parity,
+                "Active": bool(active),
+                "LastUpdate": agora_utc()
+            }
+        },
+        upsert=True
+    )
+
+
+def garantir_documento_sala(player, room):
+    col_room_occupation.update_one(
+        {
+            "Player": int(player),
+            "Room": int(room)
+        },
+        {
+            "$setOnInsert": {
+                "OddCount": 0,
+                "EvenCount": 0,
+                "TotalCount": 0,
+                "TriggerCount": 0,
+                "LastUpdate": agora_utc()
+            }
+        },
+        upsert=True
+    )
+
+
+def atualizar_ocupacao(player, room, parity, delta):
+    player = int(player)
+    room = int(room)
+
+    if room <= 0:
+        return
+
+    garantir_documento_sala(player, room)
+
+    sala = col_room_occupation.find_one({"Player": player, "Room": room})
+    odd = int(sala.get("OddCount", 0))
+    even = int(sala.get("EvenCount", 0))
+    total = int(sala.get("TotalCount", 0))
+
+    if parity == "odd":
+        odd = max(0, odd + delta)
+    else:
+        even = max(0, even + delta)
+
+    total = max(0, odd + even)
+
+    col_room_occupation.update_one(
+        {"Player": player, "Room": room},
+        {
+            "$set": {
+                "OddCount": odd,
+                "EvenCount": even,
+                "TotalCount": total,
+                "LastUpdate": agora_utc()
+            }
+        }
+    )
+
+
+def verificar_e_disparar_score(player, room):
+    player = int(player)
+    room = int(room)
+
+    if room <= 0:
+        return
+
+    sala = col_room_occupation.find_one({"Player": player, "Room": room})
+    if not sala:
+        return
+
+    odd = int(sala.get("OddCount", 0))
+    even = int(sala.get("EvenCount", 0))
+    trigger_count = int(sala.get("TriggerCount", 0))
+
+    if odd > 0 and odd == even and trigger_count < MAX_SCORE_POR_SALA:
+        # evita disparos repetidos para o mesmo estado exato
+        ultimo_evento = col_score_events.find_one(
+            {
+                "Player": player,
+                "Room": room,
+                "OddCount": odd,
+                "EvenCount": even
+            },
+            sort=[("TriggeredAt", -1)]
+        )
+
+        if ultimo_evento:
+            # já disparou para este equilíbrio exato
+            return
+
+        enviar_score(player, room)
+
+        col_score_events.insert_one({
+            "Player": player,
+            "Room": room,
+            "OddCount": odd,
+            "EvenCount": even,
+            "TriggeredAt": agora_utc()
+        })
+
+        col_room_occupation.update_one(
+            {"Player": player, "Room": room},
+            {
+                "$inc": {"TriggerCount": 1},
+                "$set": {"LastUpdate": agora_utc()}
+            }
+        )
+
+
+def tratar_movimento(documento):
+    player = int(documento["Player"])
+    marsami = int(documento["Marsami"])
+    origem = int(documento["RoomOrigin"])
+    destino = int(documento["RoomDestiny"])
+    status = int(documento["Status"])
+
+    parity = obter_paridade(marsami)
+    estado_atual = obter_estado_marsami(player, marsami)
+
+    # -----------------------------------------------------
+    # CASO 1: LARGADA INICIAL
+    # origem = 0, destino > 0
+    # -----------------------------------------------------
+    if origem == 0 and destino > 0:
+        # se já existia um estado anterior por erro/repetição, remove da sala antiga
+        if estado_atual and int(estado_atual.get("CurrentRoom", 0)) > 0:
+            atualizar_ocupacao(player, int(estado_atual["CurrentRoom"]), parity, -1)
+
+        guardar_estado_marsami(player, marsami, destino, parity, True)
+        atualizar_ocupacao(player, destino, parity, 1)
+        verificar_e_disparar_score(player, destino)
+        return
+
+    # -----------------------------------------------------
+    # CASO 2: MARSAMI PARADO / PRESO / CANSADO
+    # origem = 0, destino = 0
+    # fica na última sala conhecida
+    # -----------------------------------------------------
+    if origem == 0 and destino == 0:
+        if estado_atual:
+            guardar_estado_marsami(
+                player,
+                marsami,
+                int(estado_atual.get("CurrentRoom", 0)),
+                parity,
+                False
+            )
+            verificar_e_disparar_score(player, int(estado_atual.get("CurrentRoom", 0)))
+        return
+
+    # -----------------------------------------------------
+    # CASO 3: MOVIMENTO NORMAL
+    # origem > 0, destino > 0
+    # -----------------------------------------------------
+    if origem > 0 and destino > 0:
+        sala_anterior = None
+
+        if estado_atual and int(estado_atual.get("CurrentRoom", 0)) > 0:
+            sala_anterior = int(estado_atual["CurrentRoom"])
+        else:
+            sala_anterior = origem
+
+        atualizar_ocupacao(player, sala_anterior, parity, -1)
+        atualizar_ocupacao(player, destino, parity, 1)
+
+        guardar_estado_marsami(player, marsami, destino, parity, True)
+
+        verificar_e_disparar_score(player, sala_anterior)
+        verificar_e_disparar_score(player, destino)
+        return
+
+    # -----------------------------------------------------
+    # CASOS ESTRANHOS
+    # -----------------------------------------------------
+    guardar_flagged("movement", documento, "Combinação origem/destino não esperada")
+
+
+# =========================================================
 # PROCESSAMENTO
 # =========================================================
 def processar_colecao(colecao, tipo):
@@ -255,6 +487,10 @@ def processar_colecao(colecao, tipo):
             ignorados += 1
             print(f"[S2] Duplicado recente ignorado ({tipo}) -> {documento['_id']}")
             continue
+
+        # tratamento adicional apenas para movimentos
+        if tipo == "movement":
+            tratar_movimento(documento)
 
         enviar_para_mqtt(tipo, documento)
         marcar_processado(colecao, documento["_id"])
