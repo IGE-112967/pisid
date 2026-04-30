@@ -12,19 +12,15 @@ from pymongo import MongoClient
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
 
-# Tópico intermédio para seguir para o S3 / MySQL.
+# Tópico intermédio usado pelo S3 para inserir no MySQL.
 MQTT_TOPIC_TO_SQL = "pisid_to_sql_34"
-
-# Tópico dos atuadores do simulador.
-MQTT_TOPIC_ACT = "pisid_mazeact"
 
 MONGO_URI = "mongodb://localhost:27017/?directConnection=true"
 MONGO_DB = "pisid"
 
-# O relatório indica granularidade de 1 segundo.
+# Granularidade de segundo, conforme definido para a migração incremental.
 INTERVALO_SEGUNDOS = 1
 JANELA_DUPLICADOS_SEGUNDOS = 10
-MAX_SCORE_POR_SALA = 3
 
 # =========================================================
 # LIGAÇÃO AO MONGO
@@ -32,22 +28,37 @@ MAX_SCORE_POR_SALA = 3
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[MONGO_DB]
 
+# Na implementação final o MongoDB fica apenas com as coleções de receção,
+# validação e sinalização. O estado do labirinto passa para o MySQL.
 col_movement = db["movement"]
 col_sound = db["sound"]
 col_temperature = db["temperature"]
 col_flagged = db["flagged"]
 
-col_marsami_state = db["marsami_state"]
-col_room_occupation = db["room_occupation"]
-col_score_events = db["score_events"]
-
-# Índices úteis para a migração incremental.
+# Índices úteis para procurar documentos por processar e controlar duplicados.
 col_movement.create_index("ProcessedAt")
 col_sound.create_index("ProcessedAt")
 col_temperature.create_index("ProcessedAt")
-col_movement.create_index([("Player", 1), ("Marsami", 1), ("RoomOrigin", 1), ("RoomDestiny", 1), ("Status", 1), ("ProcessedAt", 1)])
-col_sound.create_index([("Player", 1), ("Hour", 1), ("Sound", 1), ("ProcessedAt", 1)])
-col_temperature.create_index([("Player", 1), ("Hour", 1), ("Temperature", 1), ("ProcessedAt", 1)])
+col_movement.create_index([
+    ("Player", 1),
+    ("Marsami", 1),
+    ("RoomOrigin", 1),
+    ("RoomDestiny", 1),
+    ("Status", 1),
+    ("ProcessedAt", 1),
+])
+col_sound.create_index([
+    ("Player", 1),
+    ("Hour", 1),
+    ("Sound", 1),
+    ("ProcessedAt", 1),
+])
+col_temperature.create_index([
+    ("Player", 1),
+    ("Hour", 1),
+    ("Temperature", 1),
+    ("ProcessedAt", 1),
+])
 
 # =========================================================
 # MQTT
@@ -59,7 +70,7 @@ mqtt_client = mqtt.Client(
 
 
 def ligar_mqtt():
-    def on_connect(client, userdata, flags, reason_code, properties):
+    def on_connect(client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
             print("[S2] Ligado ao broker MQTT.")
         else:
@@ -99,8 +110,8 @@ def marcar_processado(colecao, documento_id):
 def guardar_flagged(tipo, documento, motivo, classificacao="invalid"):
     col_flagged.insert_one({
         "Tipo": tipo,
-        "Motivo": motivo,
         "Classificacao": classificacao,
+        "Motivo": motivo,
         "Documento": normalizar_documento(documento),
         "FlaggedAt": agora_utc()
     })
@@ -113,7 +124,7 @@ def enviar_para_mqtt(tipo, documento):
         "SentTimeStamp": agora_utc().isoformat()
     }
 
-    # QoS 2 porque esta mensagem já segue para escrita final em MySQL.
+    # QoS 2 porque estes dados já seguem validados para escrita final em MySQL.
     info = mqtt_client.publish(
         MQTT_TOPIC_TO_SQL,
         json.dumps(payload, ensure_ascii=False),
@@ -124,29 +135,12 @@ def enviar_para_mqtt(tipo, documento):
     print(f"[S2] Documento enviado para S3 ({tipo}) -> {documento['_id']}")
 
 
-def enviar_score(player, room):
-    payload = {
-        "Type": "Score",
-        "Player": int(player),
-        "Room": int(room)
-    }
-
-    # QoS 1 é suficiente para atuação; se o broker/simulador duplicar, o limite de score é controlado.
-    info = mqtt_client.publish(
-        MQTT_TOPIC_ACT,
-        json.dumps(payload, ensure_ascii=False),
-        qos=1
-    )
-    info.wait_for_publish()
-
-    print(f"[S2] Score enviado -> Player={player}, Room={room}")
-
-
 def data_valida(valor):
     if valor is None:
         return False
     if isinstance(valor, datetime):
         return True
+
     try:
         datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
         return True
@@ -182,7 +176,8 @@ def validar_movimento(documento):
 
 
 def validar_som(documento):
-    # O enunciado do simulador não inclui Room nas mensagens de som.
+    # As mensagens de som do simulador usam Player, Hour e Sound.
+    # Não é exigido campo Room.
     campos = ["Player", "Sound", "Hour"]
     for campo in campos:
         if campo not in documento:
@@ -207,7 +202,8 @@ def validar_som(documento):
 
 
 def validar_temperatura(documento):
-    # O enunciado do simulador não inclui Room nas mensagens de temperatura.
+    # As mensagens de temperatura do simulador usam Player, Hour e Temperature.
+    # Não é exigido campo Room.
     campos = ["Player", "Temperature", "Hour"]
     for campo in campos:
         if campo not in documento:
@@ -284,159 +280,6 @@ def existe_igual_tratado_recentemente(colecao, tipo, documento):
 
 
 # =========================================================
-# TRATAMENTO DE MARSAMIS / OCUPAÇÃO / SCORE EM MONGO
-# =========================================================
-def obter_paridade(marsami):
-    return "even" if int(marsami) % 2 == 0 else "odd"
-
-
-def obter_estado_marsami(player, marsami):
-    return col_marsami_state.find_one({
-        "Player": int(player),
-        "Marsami": int(marsami)
-    })
-
-
-def guardar_estado_marsami(player, marsami, room, parity, active=True):
-    col_marsami_state.update_one(
-        {"Player": int(player), "Marsami": int(marsami)},
-        {"$set": {
-            "CurrentRoom": int(room),
-            "Parity": parity,
-            "Active": bool(active),
-            "LastUpdate": agora_utc()
-        }},
-        upsert=True
-    )
-
-
-def garantir_documento_sala(player, room):
-    col_room_occupation.update_one(
-        {"Player": int(player), "Room": int(room)},
-        {"$setOnInsert": {
-            "OddCount": 0,
-            "EvenCount": 0,
-            "TotalCount": 0,
-            "TriggerCount": 0,
-            "LastUpdate": agora_utc()
-        }},
-        upsert=True
-    )
-
-
-def atualizar_ocupacao(player, room, parity, delta):
-    player = int(player)
-    room = int(room)
-
-    if room <= 0:
-        return
-
-    garantir_documento_sala(player, room)
-    sala = col_room_occupation.find_one({"Player": player, "Room": room})
-
-    odd = int(sala.get("OddCount", 0))
-    even = int(sala.get("EvenCount", 0))
-
-    if parity == "odd":
-        odd = max(0, odd + delta)
-    else:
-        even = max(0, even + delta)
-
-    col_room_occupation.update_one(
-        {"Player": player, "Room": room},
-        {"$set": {
-            "OddCount": odd,
-            "EvenCount": even,
-            "TotalCount": odd + even,
-            "LastUpdate": agora_utc()
-        }}
-    )
-
-
-def verificar_e_disparar_score(player, room):
-    player = int(player)
-    room = int(room)
-
-    if room <= 0:
-        return
-
-    sala = col_room_occupation.find_one({"Player": player, "Room": room})
-    if not sala:
-        return
-
-    odd = int(sala.get("OddCount", 0))
-    even = int(sala.get("EvenCount", 0))
-    trigger_count = int(sala.get("TriggerCount", 0))
-
-    if odd > 0 and odd == even and trigger_count < MAX_SCORE_POR_SALA:
-        ultimo_evento = col_score_events.find_one({
-            "Player": player,
-            "Room": room,
-            "OddCount": odd,
-            "EvenCount": even
-        })
-
-        if ultimo_evento:
-            return
-
-        enviar_score(player, room)
-
-        col_score_events.insert_one({
-            "Player": player,
-            "Room": room,
-            "OddCount": odd,
-            "EvenCount": even,
-            "TriggeredAt": agora_utc()
-        })
-
-        col_room_occupation.update_one(
-            {"Player": player, "Room": room},
-            {"$inc": {"TriggerCount": 1}, "$set": {"LastUpdate": agora_utc()}}
-        )
-
-
-def tratar_movimento(documento):
-    player = int(documento["Player"])
-    marsami = int(documento["Marsami"])
-    origem = int(documento["RoomOrigin"])
-    destino = int(documento["RoomDestiny"])
-
-    parity = obter_paridade(marsami)
-    estado_atual = obter_estado_marsami(player, marsami)
-
-    if origem == 0 and destino > 0:
-        if estado_atual and int(estado_atual.get("CurrentRoom", 0)) > 0:
-            atualizar_ocupacao(player, int(estado_atual["CurrentRoom"]), parity, -1)
-
-        guardar_estado_marsami(player, marsami, destino, parity, True)
-        atualizar_ocupacao(player, destino, parity, 1)
-        verificar_e_disparar_score(player, destino)
-        return
-
-    if origem == 0 and destino == 0:
-        if estado_atual:
-            sala_atual = int(estado_atual.get("CurrentRoom", 0))
-            guardar_estado_marsami(player, marsami, sala_atual, parity, False)
-            verificar_e_disparar_score(player, sala_atual)
-        return
-
-    if origem > 0 and destino > 0:
-        if estado_atual and int(estado_atual.get("CurrentRoom", 0)) > 0:
-            sala_anterior = int(estado_atual["CurrentRoom"])
-        else:
-            sala_anterior = origem
-
-        atualizar_ocupacao(player, sala_anterior, parity, -1)
-        atualizar_ocupacao(player, destino, parity, 1)
-        guardar_estado_marsami(player, marsami, destino, parity, True)
-        verificar_e_disparar_score(player, sala_anterior)
-        verificar_e_disparar_score(player, destino)
-        return
-
-    guardar_flagged("movement", documento, "Combinação origem/destino não esperada", "invalid")
-
-
-# =========================================================
 # PROCESSAMENTO
 # =========================================================
 def processar_colecao(colecao, tipo):
@@ -469,9 +312,8 @@ def processar_colecao(colecao, tipo):
             print(f"[S2] Duplicado recente ignorado ({tipo}) -> {documento['_id']}")
             continue
 
-        if tipo == "movement":
-            tratar_movimento(documento)
-
+        # O S2 já não atualiza marsami_state/room_occupation/score_events no Mongo.
+        # Essa lógica passou para Stored Procedures/Triggers no MySQL.
         enviar_para_mqtt(tipo, documento)
         marcar_processado(colecao, documento["_id"])
         enviados += 1
@@ -485,7 +327,7 @@ def processar_colecao(colecao, tipo):
 # =========================================================
 def main():
     ligar_mqtt()
-    print("[S2] Serviço iniciado.")
+    print("[S2] Serviço iniciado. Estado do labirinto será mantido no MySQL.")
 
     try:
         while True:
