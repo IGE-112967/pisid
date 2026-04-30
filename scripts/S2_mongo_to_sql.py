@@ -22,6 +22,12 @@ MONGO_DB = "pisid"
 INTERVALO_SEGUNDOS = 1
 JANELA_DUPLICADOS_SEGUNDOS = 10
 
+# Outliers por variação face à última leitura válida do mesmo Player.
+# O valor atual tem de ficar dentro do intervalo:
+# último_valor - 150% até último_valor + 150%.
+# Exemplo: último som = 20 -> intervalo aceite: -10 a 50.
+PERCENTAGEM_VARIACAO_OUTLIER = 1.5
+
 # =========================================================
 # LIGAÇÃO AO MONGO
 # =========================================================
@@ -100,10 +106,14 @@ def normalizar_documento(documento):
     return {chave: normalizar_valor(valor) for chave, valor in documento.items()}
 
 
-def marcar_processado(colecao, documento_id):
+def marcar_processado(colecao, documento_id, extra=None):
+    dados = {"ProcessedAt": agora_utc()}
+    if extra:
+        dados.update(extra)
+
     colecao.update_one(
         {"_id": documento_id},
-        {"$set": {"ProcessedAt": agora_utc()}}
+        {"$set": dados}
     )
 
 
@@ -237,6 +247,107 @@ def documento_valido(tipo, documento):
     return False, "Tipo desconhecido", "invalid"
 
 
+
+# =========================================================
+# OUTLIERS POR VARIAÇÃO FACE À ÚLTIMA LEITURA VÁLIDA
+# =========================================================
+def obter_ultimo_valor_valido(colecao, player, campo_valor, documento_id_atual):
+    """
+    Procura a última leitura válida já enviada para o S3/MySQL.
+    Não usa documentos flagged nem duplicados, porque só os documentos enviados
+    recebem SentToSql=True.
+    """
+    ultimo = colecao.find_one(
+        {
+            "_id": {"$ne": documento_id_atual},
+            "Player": player,
+            campo_valor: {"$exists": True},
+            "SentToSql": True,
+            "ProcessedAt": {"$ne": None},
+        },
+        sort=[("ProcessedAt", -1), ("_id", -1)]
+    )
+
+    if not ultimo:
+        return None
+
+    try:
+        return float(ultimo[campo_valor])
+    except (ValueError, TypeError):
+        return None
+
+
+def fora_intervalo_mais_menos_150(valor_atual, ultimo_valor):
+    """
+    Verifica se valor_atual está fora do intervalo:
+    ultimo_valor - 150% até ultimo_valor + 150%.
+
+    Usa abs(ultimo_valor) para funcionar também se a temperatura anterior for negativa.
+    Exemplo:
+      ultimo = 20 -> margem = 30 -> intervalo [-10, 50]
+      ultimo = -10 -> margem = 15 -> intervalo [-25, 5]
+    """
+    margem = abs(ultimo_valor) * PERCENTAGEM_VARIACAO_OUTLIER
+
+    # Evita margem zero quando a última leitura é 0.
+    # Assim, um salto de 0 para um valor muito alto continua a ser detetado.
+    if margem == 0:
+        margem = 1.0
+
+    limite_inferior = ultimo_valor - margem
+    limite_superior = ultimo_valor + margem
+
+    return valor_atual < limite_inferior or valor_atual > limite_superior, limite_inferior, limite_superior
+
+
+def verificar_outlier_variacao(tipo, documento):
+    """
+    Aplica a regra de outlier por variação apenas a som e temperatura.
+    Se ainda não existir leitura válida anterior, não classifica como outlier.
+    """
+    if tipo == "sound":
+        colecao = col_sound
+        campo_valor = "Sound"
+    elif tipo == "temperature":
+        colecao = col_temperature
+        campo_valor = "Temperature"
+    else:
+        return False, None
+
+    try:
+        player = int(documento["Player"])
+        valor_atual = float(documento[campo_valor])
+    except (ValueError, TypeError, KeyError):
+        return False, None
+
+    ultimo_valor = obter_ultimo_valor_valido(
+        colecao,
+        player,
+        campo_valor,
+        documento["_id"]
+    )
+
+    if ultimo_valor is None:
+        return False, None
+
+    fora, limite_inferior, limite_superior = fora_intervalo_mais_menos_150(
+        valor_atual,
+        ultimo_valor
+    )
+
+    if fora:
+        motivo = (
+            f"{campo_valor} fora do intervalo de variação permitido. "
+            f"Último valor válido={ultimo_valor}; "
+            f"intervalo aceite=[{limite_inferior:.2f}, {limite_superior:.2f}]; "
+            f"valor atual={valor_atual}"
+        )
+        return True, motivo
+
+    return False, None
+
+
+
 # =========================================================
 # DUPLICADOS RECENTES
 # =========================================================
@@ -301,21 +412,42 @@ def processar_colecao(colecao, tipo):
         valido, motivo, classificacao = documento_valido(tipo, documento)
         if not valido:
             guardar_flagged(tipo, documento, motivo, classificacao)
-            marcar_processado(colecao, documento["_id"])
+            marcar_processado(colecao, documento["_id"], {
+                "ProcessStatus": "flagged",
+                "Classification": classificacao
+            })
             sinalizados += 1
             print(f"[S2] Documento sinalizado ({tipo}/{classificacao}) -> {documento['_id']}")
             continue
 
         if existe_igual_tratado_recentemente(colecao, tipo, documento):
-            marcar_processado(colecao, documento["_id"])
+            marcar_processado(colecao, documento["_id"], {
+                "ProcessStatus": "duplicate"
+            })
             ignorados += 1
             print(f"[S2] Duplicado recente ignorado ({tipo}) -> {documento['_id']}")
+            continue
+
+        # Outliers de som/temperatura por variação face à última leitura válida.
+        eh_outlier, motivo_outlier = verificar_outlier_variacao(tipo, documento)
+        if eh_outlier:
+            guardar_flagged(tipo, documento, motivo_outlier, "outlier")
+            marcar_processado(colecao, documento["_id"], {
+                "ProcessStatus": "flagged",
+                "Classification": "outlier"
+            })
+            sinalizados += 1
+            print(f"[S2] Outlier por variação sinalizado ({tipo}) -> {documento['_id']}")
             continue
 
         # O S2 já não atualiza marsami_state/room_occupation/score_events no Mongo.
         # Essa lógica passou para Stored Procedures/Triggers no MySQL.
         enviar_para_mqtt(tipo, documento)
-        marcar_processado(colecao, documento["_id"])
+        marcar_processado(colecao, documento["_id"], {
+            "ProcessStatus": "sent",
+            "Classification": "normal",
+            "SentToSql": True
+        })
         enviados += 1
 
     if encontrados > 0:
