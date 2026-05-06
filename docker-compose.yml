@@ -1,0 +1,54 @@
+version: '3.9'
+
+services:
+  php:
+    build:
+      context: .        
+      dockerfile: Dockerfile #Em vez de fazer download de uma imagem, ele vai ler o Dockerfile
+    volumes:
+      - ./src:/var/www/html #Localização do meu código , por exemplo, ficheitos php lidos apache
+    ports:
+      - "9000:80" #para aceder ao php no browser através de localhost:9000.
+    depends_on:
+      - mysql #Garante que o MySQL arranca antes do PHP
+  mysql:
+    platform: linux/amd64 #Garante que o MySQL corre sem erros em Macs novos.
+    image: mysql:8.0 # Evitar colocar  'latest' para ter estabilidade no MAC, se for só windows colocar latest
+    container_name: mysql # Nome qu eo container vai assunir, facultativo
+    restart: no #O Docker não tentará reiniciar o contentor automaticamente.
+    environment:
+      MYSQL_ROOT_PASSWORD: 'root'
+      MYSQL_DEFAULT_AUTHENTICATION_PLUGIN: mysql_native_password #resolver um problema de compatibilidade de "idioma" entre o PHP e o MySQL.
+    volumes:
+      - ./mysql_data/:/var/lib/mysql
+       #para os dados da base de dados não desaparecerem quando o contentor é desligado (ficam guardados/espelhados na pasta ./mysql_data/).
+       #./mysql_data/ é a pasta no computador (o "Host"), na mesma pasta onde está o ficheiro docker-compose.yml
+       #var/lib/mysql é o local dentro do contentor onde o MySQL guarda, por padrão, todos os ficheiros da base de dados (tabelas, registos, utilizadores).
+      - ./mysql_files:/var/lib/mysql-files/
+      #pasta segura dedicada à importação e exportação de ficheiros (como ficheiros .csv ou .txt) entre o teu Mac e o MySQL.
+    ports:
+      - "3306:3306"      
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    restart: always
+    ports:
+      - 9001:80 #para aceder ao phpmyadmin no browser através de localhost:9001.
+    environment:
+      PMA_ARBITRARY: 1  
+      #faz aparecer um campo extra chamado "Servidor" (ou Server) no ecrã de login do phpMyAdmin (localhost:9001), ou seja, permtite aceder a contentores de outro projeto 
+    depends_on:
+      - mysql
+
+  mongodb: 
+    image: mongo:latest 
+    container_name: mongodb # Nome qu eo container vai assunir, facultativo
+    restart: always 
+    ports:
+      - "27017:27017" 
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root
+    volumes: #ver notas em Mysql
+      - ./mongo_data:/data/db 
+      - ./mongo_files:/tmp/import
